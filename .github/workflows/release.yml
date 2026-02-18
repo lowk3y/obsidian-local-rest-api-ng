@@ -1,0 +1,43 @@
+name: Release Obsidian Plugin
+on:
+  push:
+    tags:
+      - '*'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Get Version
+        id: version
+        run: |
+          echo "tag=$(git describe --abbrev=0)" >> $GITHUB_OUTPUT
+
+      - name: Build
+        run: |
+          npm install
+          npm run build --if-present
+
+      - name: Package
+        run: |
+          mkdir ${{ github.event.repository.name }}
+          cp main.js manifest.json styles.css README.md ${{ github.event.repository.name }}
+          zip -r ${{ github.event.repository.name }}-${{ steps.version.outputs.tag }}.zip ${{ github.event.repository.name }}
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ./${{ github.event.repository.name }}-${{ steps.version.outputs.tag }}.zip
+            ./main.js
+            ./manifest.json
+            ./styles.css

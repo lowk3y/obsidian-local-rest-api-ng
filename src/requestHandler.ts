@@ -1,0 +1,1525 @@
+import {
+  apiVersion,
+  App,
+  CachedMetadata,
+  Command,
+  PluginManifest,
+  prepareSimpleSearch,
+  TFile,
+} from "obsidian";
+import periodicNotes from "obsidian-daily-notes-interface";
+import { getAPI as getDataviewAPI } from "obsidian-dataview";
+import forge from "node-forge";
+
+import express from "express";
+import http from "http";
+import cors from "cors";
+import mime from "mime-types";
+import bodyParser from "body-parser";
+import jsonLogic from "json-logic-js";
+import responseTime from "response-time";
+import queryString from "query-string";
+import WildcardRegexp from "glob-to-regexp";
+import path from "path";
+import {
+  applyPatch,
+  getDocumentMap,
+  ContentType,
+  PatchFailed,
+  PatchInstruction,
+  PatchOperation,
+  PatchTargetType,
+} from "markdown-patch";
+
+import {
+  CannedResponse,
+  DocumentMapObject,
+  ErrorCode,
+  ErrorResponseDescriptor,
+  FileMetadataObject,
+  LocalRestApiSettings,
+  PeriodicNoteInterface,
+  SearchContext,
+  SearchJsonResponseItem,
+  SearchResponseItem,
+} from "./types";
+import type { AuditLogger } from "./audit/audit-logger";
+import {
+  findHeadingBoundary,
+  getCertificateIsUptoStandards,
+  getCertificateValidityDays,
+  getSplicePosition,
+  toArrayBuffer,
+} from "./utils";
+import {
+  CERT_NAME,
+  ContentTypes,
+  ERROR_CODE_MESSAGES,
+  MaximumRequestSize,
+} from "./constants";
+import LocalRestApiPublicApi from "./api";
+
+// Import openapi.yaml as a string
+import openapiYaml from "../docs/openapi.yaml";
+
+export default class RequestHandler {
+  app: App;
+  api: express.Express;
+  manifest: PluginManifest;
+  settings: LocalRestApiSettings;
+
+  securityFilterMiddleware: express.RequestHandler | null = null;
+  auditLogger: AuditLogger | null = null;
+
+  apiExtensionRouter: express.Router;
+  apiExtensions: {
+    manifest: PluginManifest;
+    api: LocalRestApiPublicApi;
+  }[] = [];
+
+  constructor(
+    app: App,
+    manifest: PluginManifest,
+    settings: LocalRestApiSettings,
+  ) {
+    this.app = app;
+    this.manifest = manifest;
+    this.api = express();
+    this.settings = settings;
+
+    this.apiExtensionRouter = express.Router();
+
+    this.api.set("json spaces", 2);
+
+    jsonLogic.add_operation(
+      "glob",
+      (pattern: string | undefined, field: string | undefined) => {
+        if (typeof field === "string" && typeof pattern === "string") {
+          const glob = WildcardRegexp(pattern);
+          return glob.test(field);
+        }
+        return false;
+      },
+    );
+    jsonLogic.add_operation(
+      "regexp",
+      (pattern: string | undefined, field: string | undefined) => {
+        if (typeof field === "string" && typeof pattern === "string") {
+          const rex = new RegExp(pattern);
+          return rex.test(field);
+        }
+        return false;
+      },
+    );
+  }
+
+  registerApiExtension(manifest: PluginManifest): LocalRestApiPublicApi {
+    let api: LocalRestApiPublicApi | undefined = undefined;
+    for (const { manifest: existingManifest, api: existingApi } of this
+      .apiExtensions) {
+      if (JSON.stringify(existingManifest) === JSON.stringify(manifest)) {
+        api = existingApi;
+        break;
+      }
+    }
+    if (!api) {
+      const router = express.Router();
+      this.apiExtensionRouter.use(router);
+      api = new LocalRestApiPublicApi(router, () => {
+        const idx = this.apiExtensions.findIndex(
+          ({ manifest: storedManifest }) =>
+            JSON.stringify(manifest) === JSON.stringify(storedManifest),
+        );
+        if (idx !== -1) {
+          this.apiExtensions.splice(idx, 1);
+          this.apiExtensionRouter.stack.splice(idx, 1);
+        }
+      });
+      this.apiExtensions.push({
+        manifest,
+        api,
+      });
+    }
+
+    return api;
+  }
+
+  requestIsAuthenticated(req: express.Request): boolean {
+    const authorizationHeader = req.get(
+      this.settings.authorizationHeaderName ?? "Authorization",
+    );
+    if (authorizationHeader === `Bearer ${this.settings.apiKey}`) {
+      return true;
+    }
+
+    return false;
+  }
+
+  async authenticationMiddleware(
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction,
+  ): Promise<void> {
+    const authenticationExemptRoutes: string[] = [
+      "/",
+      `/${CERT_NAME}`,
+      "/openapi.yaml",
+    ];
+
+    if (
+      !authenticationExemptRoutes.includes(req.path) &&
+      !this.requestIsAuthenticated(req)
+    ) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.ApiKeyAuthorizationRequired,
+      });
+      return;
+    }
+
+    next();
+  }
+
+  async getDocumentMapObject(file: TFile): Promise<DocumentMapObject> {
+    const content = await this.app.vault.adapter.read(file.path);
+    const documentMap = getDocumentMap(content);
+
+    return {
+      headings: Object.keys(documentMap.heading)
+        .filter((h) => h)
+        .map((h) => h.split("\u001f").join("::")),
+      blocks: Object.keys(documentMap.block),
+      frontmatterFields: Object.keys(documentMap.frontmatter),
+    };
+  }
+
+  /**
+   * Wait for the metadata cache to become available for a file.
+   * Resolves with the current cache if it becomes available within the timeout,
+   * or with the current cache state (which may be null) when the timeout is reached.
+   */
+  private waitForFileCache(
+    file: TFile,
+    timeoutMs = 5000,
+  ): Promise<CachedMetadata | null> {
+    // Check if cache is already available
+    const existingCache = this.app.metadataCache.getFileCache(file);
+    if (existingCache) {
+      return Promise.resolve(existingCache);
+    }
+
+    // Wait for the cache to become available
+    return new Promise((resolve) => {
+      let resolved = false;
+
+      const onCacheChange = (...data: unknown[]) => {
+        const changedFile = data[0] as TFile;
+        if (changedFile.path === file.path && !resolved) {
+          resolved = true;
+          this.app.metadataCache.off("changed", onCacheChange);
+          clearTimeout(timeoutId);
+          resolve(this.app.metadataCache.getFileCache(file));
+        }
+      };
+
+      const timeoutId = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          this.app.metadataCache.off("changed", onCacheChange);
+          console.warn(
+            `[REST API] Timeout waiting for metadata cache for ${file.path} after ${timeoutMs}ms`,
+          );
+          // Return whatever cache state exists (likely null)
+          resolve(this.app.metadataCache.getFileCache(file));
+        }
+      }, timeoutMs);
+
+      this.app.metadataCache.on("changed", onCacheChange);
+
+      // After registering the listener, check again in case the cache
+      // became available and a change event was fired in the meantime.
+      const cacheAfterListener = this.app.metadataCache.getFileCache(file);
+      if (cacheAfterListener && !resolved) {
+        resolved = true;
+        this.app.metadataCache.off("changed", onCacheChange);
+        clearTimeout(timeoutId);
+        resolve(cacheAfterListener);
+      }
+    });
+  }
+
+  async getFileMetadataObject(file: TFile): Promise<FileMetadataObject> {
+    // Wait for the metadata cache to be available (with timeout)
+    // This handles the case where a file was just written and the cache
+    // hasn't been populated yet
+    const cache = await this.waitForFileCache(file);
+
+    // Gather frontmatter & strip out positioning information
+    const frontmatter = { ...(cache?.frontmatter ?? {}) };
+    delete frontmatter.position; // This just adds noise
+
+    // Gather both in-line tags (hash'd) & frontmatter tags; strip
+    // leading '#' from them if it's there, and remove duplicates
+    const directTags = (cache?.tags ?? [])
+      .filter((tag) => tag)
+      .map((tag) => tag.tag);
+    const frontmatterTags = Array.isArray(frontmatter.tags)
+      ? frontmatter.tags
+      : [];
+    const filteredTags: string[] = [...frontmatterTags, ...directTags]
+      // Filter out falsy tags
+      .filter((tag) => tag)
+      // Strip leading hash and get tag's string representation --
+      // although it should always be a string, it apparently isn't always!
+      .map((tag) => tag.toString().replace(/^#/, ""))
+      // Remove duplicates
+      .filter((value, index, self) => self.indexOf(value) === index);
+
+    return {
+      tags: filteredTags,
+      frontmatter: frontmatter,
+      stat: file.stat,
+      path: file.path,
+      content: await this.app.vault.cachedRead(file),
+    };
+  }
+
+  getResponseMessage({
+    statusCode = 400,
+    message,
+    errorCode,
+  }: ErrorResponseDescriptor): string {
+    const errorMessages: string[] = [];
+    if (errorCode) {
+      errorMessages.push(ERROR_CODE_MESSAGES[errorCode]);
+    } else {
+      errorMessages.push(http.STATUS_CODES[statusCode] ?? "Unknown Error");
+    }
+    if (message) {
+      errorMessages.push(message);
+    }
+
+    return errorMessages.join("\n");
+  }
+
+  getStatusCode({ statusCode, errorCode }: ErrorResponseDescriptor): number {
+    if (statusCode) {
+      return statusCode;
+    } else if (errorCode) {
+      return Math.floor(errorCode / 100);
+    }
+    throw new Error("Either statusCode or errorCode must be provided");
+  }
+
+  returnCannedResponse(
+    res: express.Response,
+    { statusCode, message, errorCode }: ErrorResponseDescriptor,
+  ): void {
+    if (!statusCode && !errorCode) {
+      throw new Error("Either statusCode or errorCode must be provided");
+    }
+    const response: CannedResponse = {
+      message: this.getResponseMessage({ statusCode, message, errorCode }),
+      errorCode: errorCode ?? (statusCode ?? -1) * 100,
+    };
+
+    res.status(this.getStatusCode({ statusCode, errorCode })).json(response);
+  }
+
+  root(req: express.Request, res: express.Response): void {
+    let certificate: forge.pki.Certificate | undefined;
+    try {
+      if (this.settings.crypto?.cert) {
+        certificate = forge.pki.certificateFromPem(this.settings.crypto.cert);
+      }
+    } catch (e) {
+      // This is fine, we just won't include that in the output
+    }
+
+    res.status(200).json({
+      status: "OK",
+      manifest: this.manifest,
+      versions: {
+        obsidian: apiVersion,
+        self: this.manifest.version,
+      },
+      service: "Obsidian Local REST API NG",
+      authenticated: this.requestIsAuthenticated(req),
+      certificateInfo:
+        this.requestIsAuthenticated(req) && certificate
+          ? {
+              validityDays: getCertificateValidityDays(certificate),
+              regenerateRecommended:
+                !getCertificateIsUptoStandards(certificate),
+            }
+          : undefined,
+      apiExtensions: this.requestIsAuthenticated(req)
+        ? this.apiExtensions.map(({ manifest }) => manifest)
+        : undefined,
+    });
+  }
+
+  async _vaultGet(
+    path: string,
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    if (!path || path.endsWith("/")) {
+      const files = [
+        ...new Set(
+          this.app.vault
+            .getFiles()
+            .map((e) => e.path)
+            .filter((filename) => filename.startsWith(path))
+            .map((filename) => {
+              const subPath = filename.slice(path.length);
+              if (subPath.indexOf("/") > -1) {
+                return subPath.slice(0, subPath.indexOf("/") + 1);
+              }
+              return subPath;
+            }),
+        ),
+      ];
+      files.sort();
+
+      if (files.length === 0) {
+        this.returnCannedResponse(res, { statusCode: 404 });
+        return;
+      }
+
+      res.json({
+        files: files,
+      });
+    } else {
+      const exists = await this.app.vault.adapter.exists(path);
+      const statResult = exists
+        ? await this.app.vault.adapter.stat(path)
+        : null;
+
+      if (statResult && statResult.type === "file") {
+        const content = await this.app.vault.adapter.readBinary(path);
+        const mimeType = mime.lookup(path);
+
+        res.set({
+          "Content-Disposition": `attachment; filename="${encodeURI(
+            path,
+          ).replace(",", "%2C")}"`,
+          "Content-Type":
+            `${mimeType}` +
+            (mimeType == ContentTypes.markdown ? "; charset=utf-8" : ""),
+        });
+
+        if (req.headers.accept === ContentTypes.olrapiNoteJson) {
+          const file = this.app.vault.getAbstractFileByPath(path) as TFile;
+          res.setHeader("Content-Type", ContentTypes.olrapiNoteJson);
+          res.send(
+            JSON.stringify(await this.getFileMetadataObject(file), null, 2),
+          );
+          return;
+        } else if (req.headers.accept === ContentTypes.olrapiDocumentMap) {
+          const file = this.app.vault.getAbstractFileByPath(path) as TFile;
+          res.setHeader("Content-Type", ContentTypes.olrapiNoteJson);
+          res.send(
+            JSON.stringify(await this.getDocumentMapObject(file), null, 2),
+          );
+          return;
+        }
+
+        res.send(Buffer.from(content));
+      } else {
+        this.returnCannedResponse(res, {
+          statusCode: 404,
+        });
+        return;
+      }
+    }
+  }
+
+  async vaultGet(req: express.Request, res: express.Response): Promise<void> {
+    const path = decodeURIComponent(
+      req.path.slice(req.path.indexOf("/", 1) + 1),
+    );
+
+    return this._vaultGet(path, req, res);
+  }
+
+  async _vaultPut(
+    filepath: string,
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    if (!filepath || filepath.endsWith("/")) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.RequestMethodValidOnlyForFiles,
+      });
+      return;
+    }
+
+    try {
+      await this.app.vault.createFolder(path.dirname(filepath));
+    } catch {
+      // the folder/file already exists, but we don't care
+    }
+
+    if (typeof req.body === "string") {
+      await this.app.vault.adapter.write(filepath, req.body);
+    } else {
+      await this.app.vault.adapter.writeBinary(
+        filepath,
+        toArrayBuffer(req.body),
+      );
+    }
+
+    this.returnCannedResponse(res, { statusCode: 204 });
+    return;
+  }
+
+  async vaultPut(req: express.Request, res: express.Response): Promise<void> {
+    const path = decodeURIComponent(
+      req.path.slice(req.path.indexOf("/", 1) + 1),
+    );
+
+    return this._vaultPut(path, req, res);
+  }
+
+  async _vaultPatchV2(
+    path: string,
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const headingBoundary = req.get("Heading-Boundary") || "::";
+    const heading = (req.get("Heading") || "")
+      .split(headingBoundary)
+      .filter(Boolean);
+    const contentPosition = req.get("Content-Insertion-Position");
+    let insert = false;
+    let aboveNewLine = false;
+
+    if (contentPosition === undefined) {
+      insert = false;
+    } else if (contentPosition === "beginning") {
+      insert = true;
+    } else if (contentPosition === "end") {
+      insert = false;
+    } else {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidContentInsertionPositionValue,
+      });
+      return;
+    }
+    if (typeof req.body != "string") {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.TextContentEncodingRequired,
+      });
+      return;
+    }
+
+    if (typeof req.get("Content-Insertion-Ignore-Newline") == "string") {
+      aboveNewLine =
+        req.get("Content-Insertion-Ignore-Newline")?.toLowerCase() == "true";
+    }
+
+    if (!heading.length) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.MissingHeadingHeader,
+      });
+      return;
+    }
+
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) {
+      this.returnCannedResponse(res, {
+        statusCode: 404,
+      });
+      return;
+    }
+    const cache = this.app.metadataCache.getFileCache(file);
+    if (!cache) {
+      throw new Error(
+        "Error awaiting metadata cache for file in _vaultPatchV2: cache is null",
+      );
+    }
+    const position = findHeadingBoundary(cache, heading);
+
+    if (!position) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidHeadingHeader,
+      });
+      return;
+    }
+
+    const fileContents = await this.app.vault.read(file);
+    const fileLines = fileContents.split("\n");
+
+    const splicePosition = getSplicePosition(
+      fileLines,
+      position,
+      insert,
+      aboveNewLine,
+    );
+
+    fileLines.splice(splicePosition, 0, req.body);
+
+    const content = fileLines.join("\n");
+
+    await this.app.vault.adapter.write(path, content);
+
+    console.warn(
+      `2.x PATCH implementation is deprecated and will be removed in version 4.0`,
+    );
+    res
+      .header("Deprecation", 'true; sunset-version="4.0"')
+      .header(
+        "Link",
+        '<https://github.com/coddingtonbear/obsidian-local-rest-api/wiki/Changes-to-PATCH-requests-between-versions-2.0-and-3.0>; rel="alternate"',
+      )
+      .status(200)
+      .send(content);
+  }
+
+  async _vaultPatchV3(
+    path: string,
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const operation = req.get("Operation");
+    const targetType = req.get("Target-Type");
+    const rawTarget = decodeURIComponent(req.get("Target") ?? "");
+    const contentType = req.get("Content-Type");
+    const createTargetIfMissing = req.get("Create-Target-If-Missing") == "true";
+    const applyIfContentPreexists =
+      req.get("Apply-If-Content-Preexists") == "true";
+    const trimTargetWhitespace = req.get("Trim-Target-Whitespace") == "true";
+    const targetDelimiter = req.get("Target-Delimiter") || "::";
+
+    const target =
+      targetType == "heading" ? rawTarget.split(targetDelimiter) : rawTarget;
+
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) {
+      this.returnCannedResponse(res, {
+        statusCode: 404,
+      });
+      return;
+    }
+    const fileContents = await this.app.vault.read(file);
+
+    if (!targetType) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.MissingTargetTypeHeader,
+      });
+      return;
+    }
+    if (!["heading", "block", "frontmatter"].includes(targetType)) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidTargetTypeHeader,
+      });
+      return;
+    }
+    if (!operation) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.MissingOperation,
+      });
+      return;
+    }
+    if (!["append", "prepend", "replace"].includes(operation)) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidOperation,
+      });
+      return;
+    }
+    if (!path || path.endsWith("/")) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.RequestMethodValidOnlyForFiles,
+      });
+      return;
+    }
+
+    const instruction: PatchInstruction = {
+      operation: operation as PatchOperation,
+      targetType: targetType as PatchTargetType,
+      target,
+      contentType: contentType as ContentType,
+      content: req.body,
+      applyIfContentPreexists,
+      trimTargetWhitespace,
+      createTargetIfMissing,
+    } as PatchInstruction;
+
+    try {
+      const patched = applyPatch(fileContents, instruction);
+      await this.app.vault.adapter.write(path, patched);
+      res.status(200).send(patched);
+    } catch (e) {
+      if (e instanceof PatchFailed) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.PatchFailed,
+          message: e.reason,
+        });
+      } else {
+        this.returnCannedResponse(res, {
+          statusCode: 500,
+          message: (e as Error).message,
+        });
+      }
+    }
+  }
+
+  async _vaultPatch(
+    path: string,
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    if (!path || path.endsWith("/")) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.RequestMethodValidOnlyForFiles,
+      });
+      return;
+    }
+
+    if (req.get("Heading") && !req.get("Target-Type")) {
+      return this._vaultPatchV2(path, req, res);
+    }
+    return this._vaultPatchV3(path, req, res);
+  }
+
+  async vaultPatch(req: express.Request, res: express.Response): Promise<void> {
+    const path = decodeURIComponent(
+      req.path.slice(req.path.indexOf("/", 1) + 1),
+    );
+
+    return this._vaultPatch(path, req, res);
+  }
+
+  async _vaultPost(
+    filepath: string,
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    if (!filepath || filepath.endsWith("/")) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.RequestMethodValidOnlyForFiles,
+      });
+      return;
+    }
+
+    if (typeof req.body != "string") {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.TextContentEncodingRequired,
+      });
+      return;
+    }
+
+    try {
+      await this.app.vault.createFolder(path.dirname(filepath));
+    } catch {
+      // the folder/file already exists, but we don't care
+    }
+
+    let fileContents = "";
+    const file = this.app.vault.getAbstractFileByPath(filepath);
+    if (file instanceof TFile) {
+      fileContents = await this.app.vault.read(file);
+      if (!fileContents.endsWith("\n")) {
+        fileContents += "\n";
+      }
+    }
+
+    fileContents += req.body;
+
+    await this.app.vault.adapter.write(filepath, fileContents);
+
+    this.returnCannedResponse(res, { statusCode: 204 });
+    return;
+  }
+
+  async vaultPost(req: express.Request, res: express.Response): Promise<void> {
+    const path = decodeURIComponent(
+      req.path.slice(req.path.indexOf("/", 1) + 1),
+    );
+
+    return this._vaultPost(path, req, res);
+  }
+
+  async _vaultDelete(
+    path: string,
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    if (!path || path.endsWith("/")) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.RequestMethodValidOnlyForFiles,
+      });
+      return;
+    }
+
+    const pathExists = await this.app.vault.adapter.exists(path);
+    if (!pathExists) {
+      this.returnCannedResponse(res, { statusCode: 404 });
+      return;
+    }
+
+    await this.app.vault.adapter.remove(path);
+    this.returnCannedResponse(res, { statusCode: 204 });
+    return;
+  }
+
+  async vaultDelete(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const path = decodeURIComponent(
+      req.path.slice(req.path.indexOf("/", 1) + 1),
+    );
+
+    return this._vaultDelete(path, req, res);
+  }
+
+  getPeriodicNoteInterface(): Record<string, PeriodicNoteInterface> {
+    return {
+      daily: {
+        settings: periodicNotes.getDailyNoteSettings(),
+        loaded: periodicNotes.appHasDailyNotesPluginLoaded(),
+        create: periodicNotes.createDailyNote,
+        get: periodicNotes.getDailyNote,
+        getAll: periodicNotes.getAllDailyNotes,
+      },
+      weekly: {
+        settings: periodicNotes.getWeeklyNoteSettings(),
+        loaded: periodicNotes.appHasWeeklyNotesPluginLoaded(),
+        create: periodicNotes.createWeeklyNote,
+        get: periodicNotes.getWeeklyNote,
+        getAll: periodicNotes.getAllWeeklyNotes,
+      },
+      monthly: {
+        settings: periodicNotes.getMonthlyNoteSettings(),
+        loaded: periodicNotes.appHasMonthlyNotesPluginLoaded(),
+        create: periodicNotes.createMonthlyNote,
+        get: periodicNotes.getMonthlyNote,
+        getAll: periodicNotes.getAllMonthlyNotes,
+      },
+      quarterly: {
+        settings: periodicNotes.getQuarterlyNoteSettings(),
+        loaded: periodicNotes.appHasQuarterlyNotesPluginLoaded(),
+        create: periodicNotes.createQuarterlyNote,
+        get: periodicNotes.getQuarterlyNote,
+        getAll: periodicNotes.getAllQuarterlyNotes,
+      },
+      yearly: {
+        settings: periodicNotes.getYearlyNoteSettings(),
+        loaded: periodicNotes.appHasYearlyNotesPluginLoaded(),
+        create: periodicNotes.createYearlyNote,
+        get: periodicNotes.getYearlyNote,
+        getAll: periodicNotes.getAllYearlyNotes,
+      },
+    };
+  }
+
+  periodicGetInterface(
+    period: string,
+  ): [PeriodicNoteInterface | null, ErrorCode | null] {
+    const periodic = this.getPeriodicNoteInterface();
+    if (!periodic[period]) {
+      return [null, ErrorCode.PeriodDoesNotExist];
+    }
+    if (!periodic[period].loaded) {
+      return [null, ErrorCode.PeriodIsNotEnabled];
+    }
+
+    return [periodic[period], null];
+  }
+
+  periodicGetNote(
+    periodName: string,
+    timestamp: number,
+  ): [TFile | null, ErrorCode | null] {
+    const [period, err] = this.periodicGetInterface(periodName);
+    if (err || !period) {
+      return [null, err ?? ErrorCode.PeriodDoesNotExist];
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const now = (window as any).moment(timestamp);
+    const all = period.getAll();
+
+    const file = period.get(now, all);
+    if (!file) {
+      return [null, ErrorCode.PeriodicNoteDoesNotExist];
+    }
+
+    return [file, null];
+  }
+
+  async periodicGetOrCreateNote(
+    periodName: string,
+    timestamp: number,
+  ): Promise<[TFile | null, ErrorCode | null]> {
+    const [gottenFile, err] = this.periodicGetNote(periodName, timestamp);
+    let file = gottenFile;
+    if (err === ErrorCode.PeriodicNoteDoesNotExist) {
+      const [period] = this.periodicGetInterface(periodName);
+      if (!period) {
+        return [null, ErrorCode.PeriodDoesNotExist];
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const now = (window as any).moment(Date.now());
+
+      file = await period.create(now);
+
+      const metadataCachePromise = new Promise<CachedMetadata | null>(
+        (resolve) => {
+          let cache: CachedMetadata | null = null;
+
+          const interval: ReturnType<typeof setInterval> = setInterval(() => {
+            if (file) {
+              cache = this.app.metadataCache.getFileCache(file);
+              if (cache) {
+                clearInterval(interval);
+                resolve(cache);
+              }
+            }
+          }, 100);
+        },
+      );
+      await metadataCachePromise;
+    } else if (err) {
+      return [null, err];
+    }
+
+    return [file, null];
+  }
+
+  redirectToVaultPath(
+    file: TFile,
+    req: express.Request,
+    res: express.Response,
+    handler: (
+      path: string,
+      req: express.Request,
+      res: express.Response,
+    ) => void,
+  ): void {
+    const path = file.path;
+    res.set("Content-Location", encodeURI(path));
+
+    return handler(path, req, res);
+  }
+
+  getPeriodicDateFromParams(params: {
+    year?: string;
+    month?: string;
+    day?: string;
+  }): number {
+    const { year, month, day } = params;
+
+    if (year && month && day) {
+      const date = new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
+      return date.getTime();
+    }
+
+    return Date.now();
+  }
+
+  async periodicGet(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const date = this.getPeriodicDateFromParams(req.params);
+    const [file, err] = this.periodicGetNote(req.params.period, date);
+    if (err || !file) {
+      this.returnCannedResponse(res, {
+        errorCode: err ?? ErrorCode.PeriodicNoteDoesNotExist,
+      });
+      return;
+    }
+
+    return this.redirectToVaultPath(file, req, res, this._vaultGet.bind(this));
+  }
+
+  async periodicPut(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const date = this.getPeriodicDateFromParams(req.params);
+    const [file, err] = await this.periodicGetOrCreateNote(
+      req.params.period,
+      date,
+    );
+    if (err || !file) {
+      this.returnCannedResponse(res, {
+        errorCode: err ?? ErrorCode.PeriodicNoteDoesNotExist,
+      });
+      return;
+    }
+
+    return this.redirectToVaultPath(file, req, res, this._vaultPut.bind(this));
+  }
+
+  async periodicPost(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const date = this.getPeriodicDateFromParams(req.params);
+    const [file, err] = await this.periodicGetOrCreateNote(
+      req.params.period,
+      date,
+    );
+    if (err || !file) {
+      this.returnCannedResponse(res, {
+        errorCode: err ?? ErrorCode.PeriodicNoteDoesNotExist,
+      });
+      return;
+    }
+
+    return this.redirectToVaultPath(file, req, res, this._vaultPost.bind(this));
+  }
+
+  async periodicPatch(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const date = this.getPeriodicDateFromParams(req.params);
+    const [file, err] = await this.periodicGetOrCreateNote(
+      req.params.period,
+      date,
+    );
+    if (err || !file) {
+      this.returnCannedResponse(res, {
+        errorCode: err ?? ErrorCode.PeriodicNoteDoesNotExist,
+      });
+      return;
+    }
+
+    return this.redirectToVaultPath(
+      file,
+      req,
+      res,
+      this._vaultPatch.bind(this),
+    );
+  }
+
+  async periodicDelete(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const date = this.getPeriodicDateFromParams(req.params);
+    const [file, err] = this.periodicGetNote(req.params.period, date);
+    if (err || !file) {
+      this.returnCannedResponse(res, {
+        errorCode: err ?? ErrorCode.PeriodicNoteDoesNotExist,
+      });
+      return;
+    }
+
+    return this.redirectToVaultPath(
+      file,
+      req,
+      res,
+      this._vaultDelete.bind(this),
+    );
+  }
+
+  async activeFileGet(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const file = this.app.workspace.getActiveFile();
+    if (!file) {
+      this.returnCannedResponse(res, { statusCode: 404 });
+      return;
+    }
+
+    return this.redirectToVaultPath(file, req, res, this._vaultGet.bind(this));
+  }
+
+  async activeFilePut(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const file = this.app.workspace.getActiveFile();
+    if (!file) {
+      this.returnCannedResponse(res, { statusCode: 404 });
+      return;
+    }
+
+    return this.redirectToVaultPath(file, req, res, this._vaultPut.bind(this));
+  }
+
+  async activeFilePost(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const file = this.app.workspace.getActiveFile();
+    if (!file) {
+      this.returnCannedResponse(res, { statusCode: 404 });
+      return;
+    }
+
+    return this.redirectToVaultPath(file, req, res, this._vaultPost.bind(this));
+  }
+
+  async activeFilePatch(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const file = this.app.workspace.getActiveFile();
+    if (!file) {
+      this.returnCannedResponse(res, { statusCode: 404 });
+      return;
+    }
+
+    return this.redirectToVaultPath(
+      file,
+      req,
+      res,
+      this._vaultPatch.bind(this),
+    );
+  }
+
+  async activeFileDelete(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const file = this.app.workspace.getActiveFile();
+    if (!file) {
+      this.returnCannedResponse(res, { statusCode: 404 });
+      return;
+    }
+
+    return this.redirectToVaultPath(
+      file,
+      req,
+      res,
+      this._vaultDelete.bind(this),
+    );
+  }
+
+  async commandGet(req: express.Request, res: express.Response): Promise<void> {
+    const commands: Command[] = [];
+    for (const commandName in this.app.commands.commands) {
+      commands.push({
+        id: commandName,
+        name: this.app.commands.commands[commandName].name,
+      });
+    }
+
+    const commandResponse = {
+      commands: commands,
+    };
+
+    res.json(commandResponse);
+  }
+
+  async commandPost(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const cmd = this.app.commands.commands[req.params.commandId];
+
+    if (!cmd) {
+      this.returnCannedResponse(res, { statusCode: 404 });
+      return;
+    }
+
+    try {
+      this.app.commands.executeCommandById(req.params.commandId);
+    } catch (e) {
+      const error = e as Error;
+      this.returnCannedResponse(res, {
+        statusCode: 500,
+        message: error.message,
+      });
+      return;
+    }
+
+    this.returnCannedResponse(res, { statusCode: 204 });
+    return;
+  }
+
+  async searchSimplePost(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const results: SearchResponseItem[] = [];
+
+    const query: string = req.query.query as string;
+    if (!(typeof query === "string")) {
+      return this.returnCannedResponse(res, {
+        message: "A single '?query=' parameter is required.",
+        errorCode: ErrorCode.InvalidSearch,
+      });
+    }
+    const contextLengthRaw = parseInt(req.query.contextLength as string, 10);
+    const contextLength = Number.isNaN(contextLengthRaw)
+      ? 100
+      : contextLengthRaw;
+    let search: ReturnType<typeof prepareSimpleSearch>;
+    try {
+      search = prepareSimpleSearch(query);
+    } catch (e) {
+      console.error("Could not prepare simple search: ", e);
+      return this.returnCannedResponse(res, {
+        message: `${e}`,
+        errorCode: ErrorCode.ErrorPreparingSimpleSearch,
+      });
+    }
+
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const cachedContents = await this.app.vault.cachedRead(file);
+
+      // Add the filename to the search text to include it in the search.
+      const filenamePrefix = file.basename + "\n\n";
+      const result = search(filenamePrefix + cachedContents);
+
+      // We added the filename to the search text with 2 newline characters.
+      // That causes the start and end position numbers to be wrong with an offset
+      // of the char length of the filename newline characters.
+      // This is fixed by subtracting the positionOffset from the start and end position.
+      const positionOffset = filenamePrefix.length;
+
+      if (result) {
+        const contextMatches: SearchContext[] = [];
+        for (const match of result.matches) {
+          // Check if the entire match is within the filename (including the newlines).
+          // We need to ensure both start and end positions are within the filename prefix.
+          if (match[0] < positionOffset && match[1] <= positionOffset) {
+            // When start position is between 0 and positionOffset and end position is <= positionOffset,
+            // that means the search term matched entirely within the filename prefix.
+            // Clamp the end position to the basename length to ensure it doesn't exceed the context.
+            contextMatches.push({
+              match: {
+                start: match[0],
+                end: Math.min(match[1], file.basename.length),
+                source: "filename",
+              },
+              context: file.basename,
+            });
+          } else if (match[0] >= positionOffset) {
+            // Match is entirely in the content
+            contextMatches.push({
+              match: {
+                start: match[0] - positionOffset,
+                end: match[1] - positionOffset,
+                source: "content",
+              },
+              context: cachedContents.slice(
+                Math.max(match[0] - positionOffset - contextLength, 0),
+                match[1] - positionOffset + contextLength,
+              ),
+            });
+          }
+          // Matches that span the boundary between filename and content (match[0] < positionOffset
+          // && match[1] > positionOffset) are intentionally skipped as they would produce invalid
+          // results (e.g., negative start positions or incorrect source attribution).
+        }
+
+        results.push({
+          filename: file.path,
+          score: result.score,
+          matches: contextMatches,
+        });
+      }
+    }
+
+    results.sort((a, b) => ((a.score ?? 0) > (b.score ?? 0) ? 1 : -1));
+    res.json(results);
+  }
+
+  valueIsSaneTruthy(value: unknown): boolean {
+    if (value === undefined || value === null) {
+      return false;
+    } else if (Array.isArray(value)) {
+      return value.length > 0;
+    } else if (typeof value === "object") {
+      return Object.keys(value).length > 0;
+    }
+    return Boolean(value);
+  }
+
+  async searchQueryPost(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    const dataviewApi = getDataviewAPI();
+
+    const handlers: Record<string, () => Promise<SearchJsonResponseItem[]>> = {
+      [ContentTypes.dataviewDql]: async () => {
+        const results: SearchJsonResponseItem[] = [];
+        const dataviewResults = await dataviewApi.tryQuery(req.body);
+
+        const fileColumn =
+          dataviewApi.evaluationContext.settings.tableIdColumnName;
+
+        if (dataviewResults.type !== "table") {
+          throw new Error("Only TABLE dataview queries are supported.");
+        }
+        if (!dataviewResults.headers.includes(fileColumn)) {
+          throw new Error("TABLE WITHOUT ID queries are not supported.");
+        }
+
+        for (const dataviewResult of dataviewResults.values) {
+          const fieldValues: Record<string, unknown> = {};
+
+          dataviewResults.headers.forEach((value: string, index: number) => {
+            if (value !== fileColumn) {
+              fieldValues[value] = dataviewResult[index];
+            }
+          });
+
+          results.push({
+            filename: dataviewResult[0].path,
+            result: fieldValues,
+          });
+        }
+
+        return results;
+      },
+      [ContentTypes.jsonLogic]: async () => {
+        const results: SearchJsonResponseItem[] = [];
+
+        for (const file of this.app.vault.getMarkdownFiles()) {
+          const fileContext = await this.getFileMetadataObject(file);
+
+          try {
+            const fileResult = jsonLogic.apply(req.body, fileContext);
+
+            if (this.valueIsSaneTruthy(fileResult)) {
+              results.push({
+                filename: file.path,
+                result: fileResult,
+              });
+            }
+          } catch (e) {
+            const error = e as Error;
+            throw new Error(`${error.message} (while processing ${file.path})`);
+          }
+        }
+
+        return results;
+      },
+    };
+    const contentType = req.headers["content-type"];
+
+    if (!contentType) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.ContentTypeSpecificationRequired,
+      });
+      return;
+    } else if (!handlers[contentType]) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidContentType,
+      });
+      return;
+    }
+
+    try {
+      const results = await handlers[contentType]();
+      res.json(results);
+    } catch (e) {
+      const error = e as Error;
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidFilterQuery,
+        message: `${error.message}`,
+      });
+      return;
+    }
+  }
+
+  async openPost(req: express.Request, res: express.Response): Promise<void> {
+    const path = decodeURIComponent(
+      req.path.slice(req.path.indexOf("/", 1) + 1),
+    );
+
+    const query = queryString.parseUrl(req.originalUrl, {
+      parseBooleans: true,
+    }).query;
+    const newLeaf = Boolean(query.newLeaf);
+
+    this.app.workspace.openLinkText(path, "/", newLeaf);
+
+    res.json();
+  }
+
+  async certificateGet(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    if (!this.settings.crypto?.cert) {
+      this.returnCannedResponse(res, { statusCode: 404 });
+      return;
+    }
+    res.set(
+      "Content-type",
+      `application/octet-stream; filename="${CERT_NAME}"`,
+    );
+    res.status(200).send(this.settings.crypto.cert);
+  }
+
+  async openapiYamlGet(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    res.setHeader("Content-Type", "application/yaml; charset=utf-8");
+    res.status(200).send(openapiYaml);
+  }
+
+  async notFoundHandler(
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction,
+  ): Promise<void> {
+    this.returnCannedResponse(res, {
+      statusCode: 404,
+    });
+    return;
+  }
+
+  async errorHandler(
+    err: Error,
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction,
+  ): Promise<void> {
+    if (err.stack) {
+      console.error(err.stack);
+    } else {
+      console.error("No stack available!");
+    }
+    this.auditLogger?.logError({
+      level: "error",
+      message: err.message || "unhandled server error",
+      clientIp: req.ip ?? req.socket.remoteAddress ?? "127.0.0.1",
+      method: req.method,
+      path: req.originalUrl || req.url,
+      statusCode: 500,
+    });
+    if (err instanceof SyntaxError) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidContentForContentType,
+      });
+      return;
+    }
+    this.returnCannedResponse(res, {
+      statusCode: 500,
+      message: err.message,
+    });
+    return;
+  }
+
+  setupRouter() {
+    // Access log middleware — logs ALL requests in Combined Log Format
+    if (this.auditLogger) {
+      const auditLogger = this.auditLogger;
+      this.api.use((req, res, next) => {
+        const start = Date.now();
+        res.on("finish", () => {
+          auditLogger.logAccess({
+            remoteAddr: req.ip ?? req.socket.remoteAddress ?? "127.0.0.1",
+            method: req.method,
+            path: req.originalUrl || req.url,
+            httpVersion: req.httpVersion,
+            statusCode: res.statusCode,
+            contentLength: parseInt(res.getHeader("content-length") as string, 10) || 0,
+            referer: req.get("referer") ?? "",
+            userAgent: req.get("user-agent") ?? "",
+          });
+        });
+        next();
+      });
+    }
+    this.api.use((req, res, next) => {
+      const originalSend = res.send;
+      res.send = function (body, ...args) {
+        console.log(`[REST API] ${req.method} ${req.url} => ${res.statusCode}`);
+
+        return originalSend.apply(res, [body, ...args]);
+      };
+      next();
+    });
+    this.api.use(responseTime());
+    this.api.use(cors());
+    this.api.use(this.authenticationMiddleware.bind(this));
+    // Security filter middleware — after auth, before body parsers
+    if (this.securityFilterMiddleware) {
+      this.api.use(this.securityFilterMiddleware);
+    }
+    this.api.use(
+      bodyParser.text({
+        type: ContentTypes.dataviewDql,
+        limit: MaximumRequestSize,
+      }),
+    );
+    this.api.use(
+      bodyParser.json({
+        type: ContentTypes.json,
+        strict: false,
+        limit: MaximumRequestSize,
+      }),
+    );
+    this.api.use(
+      bodyParser.json({
+        type: ContentTypes.olrapiNoteJson,
+        strict: false,
+        limit: MaximumRequestSize,
+      }),
+    );
+    this.api.use(
+      bodyParser.json({
+        type: ContentTypes.jsonLogic,
+        strict: false,
+        limit: MaximumRequestSize,
+      }),
+    );
+    this.api.use(
+      bodyParser.text({ type: "text/*", limit: MaximumRequestSize }),
+    );
+    this.api.use(bodyParser.raw({ type: "*/*", limit: MaximumRequestSize }));
+
+    this.api
+      .route("/active/")
+      .get(this.activeFileGet.bind(this))
+      .put(this.activeFilePut.bind(this))
+      .patch(this.activeFilePatch.bind(this))
+      .post(this.activeFilePost.bind(this))
+      .delete(this.activeFileDelete.bind(this));
+
+    this.api
+      .route("/vault/*")
+      .get(this.vaultGet.bind(this))
+      .put(this.vaultPut.bind(this))
+      .patch(this.vaultPatch.bind(this))
+      .post(this.vaultPost.bind(this))
+      .delete(this.vaultDelete.bind(this));
+
+    this.api
+      .route("/periodic/:period/")
+      .get(this.periodicGet.bind(this))
+      .put(this.periodicPut.bind(this))
+      .patch(this.periodicPatch.bind(this))
+      .post(this.periodicPost.bind(this))
+      .delete(this.periodicDelete.bind(this));
+    this.api
+      .route("/periodic/:period/:year/:month/:day/")
+      .get(this.periodicGet.bind(this))
+      .put(this.periodicPut.bind(this))
+      .patch(this.periodicPatch.bind(this))
+      .post(this.periodicPost.bind(this))
+      .delete(this.periodicDelete.bind(this));
+
+    this.api.route("/commands/").get(this.commandGet.bind(this));
+    this.api.route("/commands/:commandId/").post(this.commandPost.bind(this));
+
+    this.api.route("/search/").post(this.searchQueryPost.bind(this));
+    this.api.route("/search/simple/").post(this.searchSimplePost.bind(this));
+
+    this.api.route("/open/*").post(this.openPost.bind(this));
+
+    this.api.get(`/${CERT_NAME}`, this.certificateGet.bind(this));
+    this.api.get("/openapi.yaml", this.openapiYamlGet.bind(this));
+    this.api.get("/", this.root.bind(this));
+
+    this.api.use(this.apiExtensionRouter);
+
+    this.api.use(this.notFoundHandler.bind(this));
+    this.api.use(this.errorHandler.bind(this));
+  }
+}

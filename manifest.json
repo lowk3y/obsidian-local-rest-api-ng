@@ -1,0 +1,10 @@
+{
+	"id": "local-rest-api-ng",
+	"name": "Local REST API NG",
+	"version": "1.0.0",
+	"minAppVersion": "0.12.0",
+	"description": "Security-hardened REST API for Obsidian with configurable access filtering, read-only mode, and audit logging.",
+	"author": "lowk3y (fork of coddingtonbear/obsidian-local-rest-api)",
+	"authorUrl": "https://github.com/lowk3y",
+	"isDesktopOnly": true
+}
