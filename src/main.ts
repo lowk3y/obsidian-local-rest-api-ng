@@ -92,6 +92,7 @@ export default class LocalRestApi extends Plugin {
       this.settings
     );
     this.requestHandler.auditLogger = auditLogger;
+    this.requestHandler.filterEngine = filterEngine;
     this.requestHandler.securityFilterMiddleware =
       createSecurityFilterMiddleware(
         this.app,

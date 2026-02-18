@@ -43,7 +43,9 @@ import {
   SearchJsonResponseItem,
   SearchResponseItem,
 } from "./types";
+import type { FilterEngine } from "./filters/filter-engine";
 import type { AuditLogger } from "./audit/audit-logger";
+import { SecurityErrorCode } from "./constants";
 import {
   findHeadingBoundary,
   getCertificateIsUptoStandards,
@@ -70,6 +72,7 @@ export default class RequestHandler {
 
   securityFilterMiddleware: express.RequestHandler | null = null;
   auditLogger: AuditLogger | null = null;
+  filterEngine: FilterEngine | null = null;
 
   apiExtensionRouter: express.Router;
   apiExtensions: {
@@ -177,6 +180,35 @@ export default class RequestHandler {
     }
 
     next();
+  }
+
+  private async checkSecurityFilter(
+    filePath: string,
+    method: string,
+    req: express.Request,
+    res: express.Response,
+  ): Promise<boolean> {
+    if (!this.filterEngine || !this.settings.securityFilterEnabled) return true;
+    const decision = await this.filterEngine.evaluateFile(
+      filePath,
+      this.settings as any,
+      method,
+    );
+    if (!decision.allowed) {
+      this.auditLogger?.logError({
+        level: "warn",
+        message: `periodic route access denied: ${decision.reason}`,
+        clientIp: req.ip ?? "127.0.0.1",
+        method,
+        path: req.path,
+        statusCode: 403,
+      });
+      res
+        .status(403)
+        .json({ message: "Access denied", errorCode: SecurityErrorCode.AccessDenied });
+      return false;
+    }
+    return true;
   }
 
   async getDocumentMapObject(file: TFile): Promise<DocumentMapObject> {
@@ -932,6 +964,9 @@ export default class RequestHandler {
       return;
     }
 
+    const allowed = await this.checkSecurityFilter(file.path, req.method, req, res);
+    if (!allowed) return;
+
     return this.redirectToVaultPath(file, req, res, this._vaultGet.bind(this));
   }
 
@@ -950,6 +985,9 @@ export default class RequestHandler {
       });
       return;
     }
+
+    const allowed = await this.checkSecurityFilter(file.path, req.method, req, res);
+    if (!allowed) return;
 
     return this.redirectToVaultPath(file, req, res, this._vaultPut.bind(this));
   }
@@ -970,6 +1008,9 @@ export default class RequestHandler {
       return;
     }
 
+    const allowed = await this.checkSecurityFilter(file.path, req.method, req, res);
+    if (!allowed) return;
+
     return this.redirectToVaultPath(file, req, res, this._vaultPost.bind(this));
   }
 
@@ -988,6 +1029,9 @@ export default class RequestHandler {
       });
       return;
     }
+
+    const allowed = await this.checkSecurityFilter(file.path, req.method, req, res);
+    if (!allowed) return;
 
     return this.redirectToVaultPath(
       file,
@@ -1009,6 +1053,9 @@ export default class RequestHandler {
       });
       return;
     }
+
+    const allowed = await this.checkSecurityFilter(file.path, req.method, req, res);
+    if (!allowed) return;
 
     return this.redirectToVaultPath(
       file,

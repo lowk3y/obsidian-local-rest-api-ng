@@ -264,8 +264,10 @@ Vault Root/
 **Expected Result:** Access denied.
 
 **Pass Criteria:**
-- [ ] `Research/confidential-research.md` is NOT readable
-- [ ] `Research/ai-paper-notes.md` IS readable (no matching keyword)
+- [ ] `Research/confidential-research.md` is NOT readable (keyword deny)
+- [ ] `Research/ai-paper-notes.md` is NOT readable (no keyword match, but no allow rule either → default deny)
+
+**⚠️ Note:** `Research/ai-paper-notes.md` is denied by **default policy**, not by the keyword rule. There is no `allow folder Research/**` rule, so it falls through to default deny. This confirms the keyword rule is not the only gating mechanism — default policy catches everything else.
 
 ---
 
@@ -373,6 +375,37 @@ Change default policy to `allow` in settings, then retry. All three should becom
 - [ ] Archive/ files do NOT appear
 - [ ] `draft-readme.md` does NOT appear
 - [ ] `tagged-deny.md` does NOT appear
+
+---
+
+### T16: Periodic Route Security — Fix Verification
+
+**Fix:** Periodic routes (`/periodic/daily`, etc.) now enforce file-level security filtering. Previously, these routes resolved to vault files but bypassed the security filter chain entirely.
+
+**Code Change:** `src/requestHandler.ts` — added `checkSecurityFilter()` call in all 5 periodic handlers (`periodicGet`, `periodicPut`, `periodicPost`, `periodicPatch`, `periodicDelete`).
+
+**Setup:** Configure Obsidian Daily Notes to save in a **denied** folder (e.g., `Restricted/`):
+1. Settings → Daily Notes → New file location: `Restricted`
+2. Create today's daily note (Ctrl+Click on date, or command palette → "Open today's daily note")
+
+**MCP Test Prompt:**
+> "Get today's daily note from my vault"
+
+**Expected Result:** Access denied (40300). The daily note exists in `Restricted/`, which has a deny rule. Even though accessed via the `/periodic/daily` route instead of a direct file path, the security filter applies.
+
+**Alternative (no setup required):** If daily notes save to vault root (default), the note falls to default deny policy with no matching allow rule:
+
+**MCP Test Prompt:**
+> "Get today's daily note from my vault"
+
+**Expected Result:** Either 40300 (denied by default policy) or 40461 (note doesn't exist). Both confirm the periodic route is gated — a bypass would return content or a different error.
+
+**Pass Criteria:**
+- [ ] Periodic daily note in denied folder returns 40300 (not content)
+- [ ] Periodic route does NOT bypass folder deny rules
+- [ ] Periodic write (PUT/POST) to GET-only folder returns 40300
+
+**Regression Note:** This test verifies the fix from the MetadataCache Security Bypass review. Before the fix, periodic routes resolved files and served content without consulting the filter engine.
 
 ---
 

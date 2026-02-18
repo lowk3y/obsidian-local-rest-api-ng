@@ -49,7 +49,17 @@ export function checkGlobalTags(
   globalDenyTag: string,
 ): FilterDecision | null {
   const lowerTags = collectFileTags(filePath, metadataCache, vault);
-  if (!lowerTags) return null;
+  if (!lowerTags) {
+    // Fail-closed: if global tags configured, deny when cache unavailable
+    if (globalDenyTag || globalAllowTag) {
+      return {
+        allowed: false,
+        reason: "Tag cache unavailable — denied (global tags configured)",
+        filterType: "tag",
+      };
+    }
+    return null;
+  }
 
   // Global deny tag overrides everything — highest priority in the system
   if (globalDenyTag && lowerTags.includes(globalDenyTag.toLowerCase())) {
@@ -85,7 +95,14 @@ export function checkTagFilter(
   vault: any,
 ): FilterDecision | null {
   const lowerTags = collectFileTags(filePath, metadataCache, vault);
-  if (!lowerTags) return null;
+  if (!lowerTags) {
+    // Fail-closed: tag rules exist (caller gated), deny when cache unavailable
+    return {
+      allowed: false,
+      reason: "Tag cache unavailable — denied (tag rules configured)",
+      filterType: "tag",
+    };
+  }
 
   // Custom tag rules
   for (const rule of rules) {

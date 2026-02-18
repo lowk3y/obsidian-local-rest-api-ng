@@ -380,6 +380,128 @@ describe("FilterEngine.evaluateFile", () => {
     });
   });
 
+  describe("null cache with tag rules", () => {
+    it("denies when cache null + global tags configured + default allow", async () => {
+      const app = new App();
+      app.metadataCache._getFileCache = null;
+      // @ts-ignore - mock App
+      const engine = new FilterEngine(app);
+      engine.fileRules = { folder: [], name: [], tag: [], keyword: [] };
+      const result = await engine.evaluateFile("some/file.md", {
+        ...defaultSettings,
+        defaultPolicy: "allow",
+      });
+      // Should deny because global tags are configured and cache is null
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Tag cache unavailable");
+    });
+
+    it("falls through to default when cache null + no global tags configured", async () => {
+      const app = new App();
+      app.metadataCache._getFileCache = null;
+      // @ts-ignore - mock App
+      const engine = new FilterEngine(app);
+      engine.fileRules = { folder: [], name: [], tag: [], keyword: [] };
+      const result = await engine.evaluateFile("some/file.md", {
+        defaultPolicy: "allow",
+        globalAllowTag: "",
+        globalDenyTag: "",
+      });
+      // No tags configured → null cache doesn't trigger deny → falls to default allow
+      expect(result.allowed).toBe(true);
+      expect(result.reason).toContain("Default policy: allow");
+    });
+
+    it("denies when cache null + custom tag rules + default allow", async () => {
+      const app = new App();
+      app.metadataCache._getFileCache = null;
+      // @ts-ignore - mock App
+      const engine = new FilterEngine(app);
+      engine.fileRules = {
+        folder: [],
+        name: [],
+        tag: [
+          {
+            id: "r1",
+            mode: "allow",
+            pattern: "#public",
+            isRegex: false,
+            enabled: true,
+            description: "test",
+          },
+        ],
+        keyword: [],
+      };
+      const result = await engine.evaluateFile("some/file.md", {
+        defaultPolicy: "allow",
+        globalAllowTag: "",
+        globalDenyTag: "",
+      });
+      // Custom tag rules exist, cache is null → deny
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Tag cache unavailable");
+    });
+
+    it("folder rules still work when cache is null", async () => {
+      const app = new App();
+      app.metadataCache._getFileCache = null;
+      // @ts-ignore - mock App
+      const engine = new FilterEngine(app);
+      engine.fileRules = {
+        folder: [
+          {
+            id: "r1",
+            mode: "allow",
+            pattern: "Public/**",
+            isRegex: false,
+            enabled: true,
+            description: "test",
+          },
+        ],
+        name: [],
+        tag: [],
+        keyword: [],
+      };
+      const result = await engine.evaluateFile("Public/note.md", {
+        defaultPolicy: "deny",
+        globalAllowTag: "",
+        globalDenyTag: "",
+      });
+      // Folder rule matches before tags are checked → allowed
+      expect(result.allowed).toBe(true);
+    });
+
+    it("filterPaths correctly filters when some files have null cache", async () => {
+      const app = new App();
+      app.metadataCache._getFileCache = null;
+      // @ts-ignore - mock App
+      const engine = new FilterEngine(app);
+      engine.fileRules = {
+        folder: [
+          {
+            id: "r1",
+            mode: "allow",
+            pattern: "Public/**",
+            isRegex: false,
+            enabled: true,
+            description: "test",
+          },
+        ],
+        name: [],
+        tag: [],
+        keyword: [],
+      };
+      const paths = ["Public/a.md", "Private/b.md"];
+      const filtered = await engine.filterPaths(paths, {
+        ...defaultSettings,
+        globalAllowTag: "",
+        globalDenyTag: "",
+      });
+      // Public/a.md matches folder allow, Private/b.md falls to default deny
+      expect(filtered).toEqual(["Public/a.md"]);
+    });
+  });
+
   describe("no rules loaded (fileRules is null)", () => {
     it("falls through to default policy", async () => {
       const engine = makeEngine(); // no rules

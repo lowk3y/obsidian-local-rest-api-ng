@@ -2,8 +2,9 @@ import http from "http";
 import request from "supertest";
 
 import RequestHandler from "./requestHandler";
-import { LocalRestApiSettings } from "./types";
-import { CERT_NAME } from "./constants";
+import { ErrorCode, LocalRestApiSettings } from "./types";
+import { CERT_NAME, SecurityErrorCode } from "./constants";
+import { FilterEngine } from "./filters/filter-engine";
 import {
   App,
   TFile,
@@ -1174,6 +1175,114 @@ describe("requestHandler", () => {
         .post("/search/simple/")
         .set("Authorization", `Bearer ${API_KEY}`)
         .expect(400);
+    });
+  });
+
+  describe("periodic route security filter", () => {
+    it("returns 403 when filterEngine denies the periodic file", async () => {
+      const mockFile = new TFile();
+      mockFile.path = "journal/2024-01-01.md";
+
+      // Mock periodicGetNote to return our controlled file
+      jest
+        .spyOn(handler, "periodicGetNote")
+        .mockReturnValue([mockFile, null]);
+
+      // Create a mock filterEngine that denies the file
+      const mockEngine = {
+        evaluateFile: jest.fn().mockResolvedValue({
+          allowed: false,
+          reason: "Denied by folder rule",
+        }),
+      } as any;
+
+      handler.filterEngine = mockEngine;
+      (handler.settings as any).securityFilterEnabled = true;
+      (handler.settings as any).defaultPolicy = "deny";
+
+      const result = await request(server)
+        .get("/periodic/daily/")
+        .set("Authorization", `Bearer ${API_KEY}`)
+        .expect(403);
+
+      expect(result.body.errorCode).toBe(SecurityErrorCode.AccessDenied);
+      expect(mockEngine.evaluateFile).toHaveBeenCalledWith(
+        "journal/2024-01-01.md",
+        expect.anything(),
+        "GET",
+      );
+    });
+
+    it("allows periodic GET when filterEngine allows the file", async () => {
+      const mockFile = new TFile();
+      mockFile.path = "journal/2024-01-01.md";
+
+      jest
+        .spyOn(handler, "periodicGetNote")
+        .mockReturnValue([mockFile, null]);
+
+      const mockEngine = {
+        evaluateFile: jest.fn().mockResolvedValue({
+          allowed: true,
+          reason: "Allowed by folder rule",
+        }),
+      } as any;
+
+      handler.filterEngine = mockEngine;
+      (handler.settings as any).securityFilterEnabled = true;
+
+      // The file content read should succeed (mock adapter returns default content)
+      const result = await request(server)
+        .get("/periodic/daily/")
+        .set("Authorization", `Bearer ${API_KEY}`)
+        .expect(200);
+
+      expect(mockEngine.evaluateFile).toHaveBeenCalled();
+    });
+
+    it("works normally when filterEngine is null (backward compat)", async () => {
+      const mockFile = new TFile();
+      mockFile.path = "journal/2024-01-01.md";
+
+      jest
+        .spyOn(handler, "periodicGetNote")
+        .mockReturnValue([mockFile, null]);
+
+      handler.filterEngine = null;
+
+      // Should pass through without 403
+      const result = await request(server)
+        .get("/periodic/daily/")
+        .set("Authorization", `Bearer ${API_KEY}`)
+        .expect(200);
+    });
+
+    it("works normally when securityFilterEnabled is false", async () => {
+      const mockFile = new TFile();
+      mockFile.path = "journal/2024-01-01.md";
+
+      jest
+        .spyOn(handler, "periodicGetNote")
+        .mockReturnValue([mockFile, null]);
+
+      // filterEngine exists but filtering disabled
+      const mockEngine = {
+        evaluateFile: jest.fn().mockResolvedValue({
+          allowed: false,
+          reason: "Would deny",
+        }),
+      } as any;
+
+      handler.filterEngine = mockEngine;
+      (handler.settings as any).securityFilterEnabled = false;
+
+      // Should pass through — evaluateFile should NOT be called
+      const result = await request(server)
+        .get("/periodic/daily/")
+        .set("Authorization", `Bearer ${API_KEY}`)
+        .expect(200);
+
+      expect(mockEngine.evaluateFile).not.toHaveBeenCalled();
     });
   });
 
