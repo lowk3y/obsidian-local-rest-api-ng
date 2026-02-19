@@ -33,7 +33,7 @@ export async function checkKeywordFilter(
 
       if (rule.isRegex) {
         try {
-          matched = new RegExp(rule.pattern).test(content!);
+          matched = new RegExp(rule.pattern, rule.regexFlags).test(content!);
         } catch {
           continue;
         }

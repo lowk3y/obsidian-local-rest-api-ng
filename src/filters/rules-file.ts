@@ -12,16 +12,22 @@ import type { FilterRule, FilterMode, HttpMethod } from "./types";
  * MODE:        allow | deny
  * FILTER_TYPE: folder | name | tag | keyword
  * PATTERN:     glob pattern, or ~regex for regex patterns
+ *              Use double quotes for patterns with spaces: "00 Workpad/**"
+ *              Regex patterns support /i flag for case-insensitive: ~pattern/i
+ *              Tag patterns support + for AND logic: #draft+#internal
  * METHODS:     optional comma-separated HTTP methods (GET,PUT,POST,PATCH,DELETE)
  *
  * Examples:
  *   allow folder PAI/**
  *   allow folder Projects/**
  *   deny  folder Private/**
+ *   allow folder "00 Workpad/**"          # quoted pattern (spaces in name)
  *   allow name   *.md
  *   deny  tag    #secret
+ *   deny  tag    #draft+#internal         # deny only if ALL tags present
  *   deny  keyword password  GET,POST
- *   allow folder ~^(PAI|Projects)/   # regex with ~ prefix
+ *   deny  keyword ~password/i             # case-insensitive regex
+ *   allow folder ~^(PAI|Projects)/        # regex with ~ prefix
  *   #!disabled deny folder Archived/**    # disabled rule
  */
 
@@ -60,15 +66,47 @@ function parseRuleLine(
     content = line.slice(DISABLED_PREFIX.length).trim();
   }
 
-  const parts = content.split(/\s+/);
-  if (parts.length < 3) {
+  // Split only the first two tokens (mode and type) on whitespace,
+  // then handle the remainder specially to support quoted patterns with spaces.
+  // e.g.: allow  folder  "00 Workpad/**"  GET,POST
+  const firstSplit = content.match(/^(\S+)\s+(\S+)\s+([\s\S]*)$/);
+  if (!firstSplit) {
     console.warn(
-      `[REST API] access-rules.conf line ${lineIndex + 1}: expected at least 3 fields, got ${parts.length}: "${line}"`,
+      `[REST API] access-rules.conf line ${lineIndex + 1}: expected at least 3 fields: "${line}"`,
     );
     return null;
   }
 
-  const [modeStr, typeStr, pattern, methodsStr] = parts;
+  const [, modeStr, typeStr, remainder] = firstSplit;
+  let pattern: string;
+  let methodsStr: string | undefined;
+
+  const trimmedRemainder = remainder.trim();
+  if (trimmedRemainder.startsWith('"')) {
+    // Quoted pattern — extract content between double quotes
+    const closeQuote = trimmedRemainder.indexOf('"', 1);
+    if (closeQuote === -1) {
+      console.warn(
+        `[REST API] access-rules.conf line ${lineIndex + 1}: unterminated quoted pattern: "${line}"`,
+      );
+      return null;
+    }
+    pattern = trimmedRemainder.slice(1, closeQuote);
+    const afterQuote = trimmedRemainder.slice(closeQuote + 1).trim();
+    methodsStr = afterQuote || undefined;
+  } else {
+    // Unquoted pattern — split on whitespace (existing behavior)
+    const remainderParts = trimmedRemainder.split(/\s+/);
+    pattern = remainderParts[0];
+    methodsStr = remainderParts[1];
+  }
+
+  if (!pattern) {
+    console.warn(
+      `[REST API] access-rules.conf line ${lineIndex + 1}: empty pattern: "${line}"`,
+    );
+    return null;
+  }
 
   const mode = modeStr.toLowerCase();
   if (!VALID_MODES.has(mode)) {
@@ -86,9 +124,19 @@ function parseRuleLine(
     return null;
   }
 
-  // Detect regex patterns (prefixed with ~)
+  // Detect regex patterns (prefixed with ~) and extract optional flags (e.g., /i)
   const isRegex = pattern.startsWith("~");
-  const cleanPattern = isRegex ? pattern.slice(1) : pattern;
+  let cleanPattern = isRegex ? pattern.slice(1) : pattern;
+  let regexFlags: string | undefined;
+
+  if (isRegex) {
+    // Extract trailing flags: ~pattern/i → pattern="pattern", flags="i"
+    const flagMatch = cleanPattern.match(/\/([gimsuy]+)$/);
+    if (flagMatch) {
+      regexFlags = flagMatch[1];
+      cleanPattern = cleanPattern.slice(0, -flagMatch[0].length);
+    }
+  }
 
   // Parse optional methods
   let methods: HttpMethod[] | undefined;
@@ -108,6 +156,7 @@ function parseRuleLine(
     enabled,
     description: `line ${lineIndex + 1}`,
     methods,
+    regexFlags,
   };
 
   return {
@@ -163,7 +212,10 @@ export function serializeRule(
   rule: FilterRule,
 ): string {
   const prefix = rule.enabled ? "" : DISABLED_PREFIX;
-  const patternStr = rule.isRegex ? `~${rule.pattern}` : rule.pattern;
+  const flagSuffix = rule.isRegex && rule.regexFlags ? `/${rule.regexFlags}` : "";
+  const rawPattern = rule.isRegex ? `~${rule.pattern}${flagSuffix}` : rule.pattern;
+  // Quote the pattern if it contains spaces
+  const patternStr = rawPattern.includes(" ") ? `"${rawPattern}"` : rawPattern;
   const methodStr =
     rule.methods && rule.methods.length > 0
       ? `  ${rule.methods.join(",")}`
@@ -296,6 +348,9 @@ export function generateDefaultRulesFile(): string {
 #   MODE         allow | deny
 #   FILTER_TYPE  folder | name | tag | keyword
 #   PATTERN      glob pattern (or ~regex with tilde prefix)
+#                Quote patterns with spaces: "00 Workpad/**"
+#                Regex flags: ~pattern/i for case-insensitive
+#                Tag AND logic: #tag1+#tag2 (deny only if ALL present)
 #   METHODS      optional: comma-separated (GET,PUT,POST,PATCH,DELETE)
 #
 # Rules are evaluated top-to-bottom. First match wins.
@@ -308,10 +363,13 @@ export function generateDefaultRulesFile(): string {
 #   allow folder PAI/**
 #   allow folder Projects/**
 #   deny  folder Private/**
+#   allow folder "00 Workpad/**"       # quote patterns with spaces
 #   allow name   *.md
 #   deny  tag    #secret
-#   deny  keyword password        GET,POST
-#   allow folder ~^(PAI|Public)/   # regex with ~ prefix
+#   deny  tag    #draft+#internal      # deny only if ALL tags present
+#   deny  keyword password             GET,POST
+#   deny  keyword ~password/i          # case-insensitive regex match
+#   allow folder ~^(PAI|Public)/       # regex with ~ prefix
 #
 # ──────────────────────────────────────────────────────────────
 

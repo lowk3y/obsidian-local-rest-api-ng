@@ -1,19 +1,27 @@
 import type { FilterRule, FilterDecision } from "./types";
 
+type TagResult =
+  | { status: "found"; tags: string[] }
+  | { status: "file_not_found" }
+  | { status: "cache_unavailable" };
+
 /**
  * Collect all tags from a file's cached metadata.
- * Returns lowercase tags array, or null if file/cache not found.
+ * Returns a discriminated result:
+ *   - "file_not_found" when the file doesn't exist in vault (e.g. POST creating new file)
+ *   - "cache_unavailable" when file exists but MetadataCache has no entry
+ *   - "found" with lowercase tags array when cache is available
  */
 function collectFileTags(
   filePath: string,
   metadataCache: any,
   vault: any,
-): string[] | null {
+): TagResult {
   const file = vault.getAbstractFileByPath(filePath);
-  if (!file) return null;
+  if (!file) return { status: "file_not_found" };
 
   const cache = metadataCache.getFileCache(file);
-  if (!cache) return null;
+  if (!cache) return { status: "cache_unavailable" };
 
   const tags: string[] = [];
 
@@ -32,7 +40,7 @@ function collectFileTags(
     }
   }
 
-  return tags.map((t) => t.toLowerCase());
+  return { status: "found", tags: tags.map((t) => t.toLowerCase()) };
 }
 
 /**
@@ -48,9 +56,16 @@ export function checkGlobalTags(
   globalAllowTag: string,
   globalDenyTag: string,
 ): FilterDecision | null {
-  const lowerTags = collectFileTags(filePath, metadataCache, vault);
-  if (!lowerTags) {
-    // Fail-closed: if global tags configured, deny when cache unavailable
+  const result = collectFileTags(filePath, metadataCache, vault);
+
+  // File doesn't exist yet (e.g. POST creating new file) — no tags to check,
+  // let folder/name rules decide access
+  if (result.status === "file_not_found") {
+    return null;
+  }
+
+  // File exists but cache unavailable — fail-closed for security
+  if (result.status === "cache_unavailable") {
     if (globalDenyTag || globalAllowTag) {
       return {
         allowed: false,
@@ -60,6 +75,8 @@ export function checkGlobalTags(
     }
     return null;
   }
+
+  const lowerTags = result.tags;
 
   // Global deny tag overrides everything — highest priority in the system
   if (globalDenyTag && lowerTags.includes(globalDenyTag.toLowerCase())) {
@@ -94,9 +111,16 @@ export function checkTagFilter(
   metadataCache: any,
   vault: any,
 ): FilterDecision | null {
-  const lowerTags = collectFileTags(filePath, metadataCache, vault);
-  if (!lowerTags) {
-    // Fail-closed: tag rules exist (caller gated), deny when cache unavailable
+  const result = collectFileTags(filePath, metadataCache, vault);
+
+  // File doesn't exist yet (e.g. POST creating new file) — no tags to check,
+  // let other filters decide access
+  if (result.status === "file_not_found") {
+    return null;
+  }
+
+  // File exists but cache unavailable — fail-closed for security
+  if (result.status === "cache_unavailable") {
     return {
       allowed: false,
       reason: "Tag cache unavailable — denied (tag rules configured)",
@@ -104,12 +128,22 @@ export function checkTagFilter(
     };
   }
 
+  const lowerTags = result.tags;
+
   // Custom tag rules
   for (const rule of rules) {
     if (!rule.enabled) continue;
 
-    const ruleTag = rule.pattern.toLowerCase();
-    const matched = lowerTags.some((t) => t === ruleTag);
+    let matched = false;
+
+    if (rule.pattern.includes("+")) {
+      // Compound AND logic: #draft+#internal matches only if ALL tags present
+      const requiredTags = rule.pattern.split("+").map((t) => t.trim().toLowerCase());
+      matched = requiredTags.every((rt) => lowerTags.some((t) => t === rt));
+    } else {
+      const ruleTag = rule.pattern.toLowerCase();
+      matched = lowerTags.some((t) => t === ruleTag);
+    }
 
     if (matched) {
       return {

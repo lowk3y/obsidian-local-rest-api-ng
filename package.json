@@ -1,6 +1,6 @@
 {
   "name": "local-rest-api-ng",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Security-hardened REST API for Obsidian with configurable access filtering, read-only mode, and audit logging.",
   "main": "main.js",
   "types": "main.d.ts",

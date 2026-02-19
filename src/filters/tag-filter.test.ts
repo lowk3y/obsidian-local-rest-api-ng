@@ -69,7 +69,7 @@ describe("checkGlobalTags", () => {
     expect(result).toBeNull();
   });
 
-  it("denies when vault file not found and global tags configured", () => {
+  it("returns null when vault file not found (e.g. POST creating new file)", () => {
     const app = new App();
     app.vault._getAbstractFileByPath = null;
 
@@ -81,9 +81,8 @@ describe("checkGlobalTags", () => {
       "#ai-deny",
     );
 
-    expect(result).not.toBeNull();
-    expect(result!.allowed).toBe(false);
-    expect(result!.reason).toContain("Tag cache unavailable");
+    // File doesn't exist → no opinion, let folder/name rules decide
+    expect(result).toBeNull();
   });
 
   it("denies when file has global deny tag", () => {
@@ -166,7 +165,7 @@ describe("checkTagFilter", () => {
     expect(result!.filterType).toBe("tag");
   });
 
-  it("denies when vault file not found and tag rules exist", () => {
+  it("returns null when vault file not found (e.g. POST creating new file)", () => {
     const app = new App();
     app.vault._getAbstractFileByPath = null;
 
@@ -186,8 +185,8 @@ describe("checkTagFilter", () => {
       app.vault,
     );
 
-    expect(result).not.toBeNull();
-    expect(result!.allowed).toBe(false);
+    // File doesn't exist → no opinion, let other filters decide
+    expect(result).toBeNull();
   });
 
   it("allows when tag matches allow rule", () => {
@@ -262,5 +261,114 @@ describe("checkTagFilter", () => {
     );
 
     expect(result).toBeNull();
+  });
+
+  describe("compound AND tag matching", () => {
+    it("denies when all compound tags are present", () => {
+      const app = new App();
+      app.metadataCache._getFileCache = new CachedMetadata();
+      app.metadataCache._getFileCache.tags = [
+        { tag: "#draft" },
+        { tag: "#internal" },
+      ];
+
+      const result = checkTagFilter(
+        "some/file.md",
+        [
+          {
+            id: "r1",
+            mode: "deny",
+            pattern: "#draft+#internal",
+            isRegex: false,
+            enabled: true,
+            description: "test",
+          },
+        ],
+        app.metadataCache,
+        app.vault,
+      );
+
+      expect(result).not.toBeNull();
+      expect(result!.allowed).toBe(false);
+    });
+
+    it("does not match when only one compound tag is present", () => {
+      const app = new App();
+      app.metadataCache._getFileCache = new CachedMetadata();
+      app.metadataCache._getFileCache.tags = [{ tag: "#draft" }];
+
+      const result = checkTagFilter(
+        "some/file.md",
+        [
+          {
+            id: "r1",
+            mode: "deny",
+            pattern: "#draft+#internal",
+            isRegex: false,
+            enabled: true,
+            description: "test",
+          },
+        ],
+        app.metadataCache,
+        app.vault,
+      );
+
+      expect(result).toBeNull();
+    });
+
+    it("matches compound tags from frontmatter and inline", () => {
+      const app = new App();
+      app.metadataCache._getFileCache = new CachedMetadata();
+      app.metadataCache._getFileCache.tags = [{ tag: "#draft" }];
+      app.metadataCache._getFileCache.frontmatter = { tags: ["internal"] };
+
+      const result = checkTagFilter(
+        "some/file.md",
+        [
+          {
+            id: "r1",
+            mode: "deny",
+            pattern: "#draft+#internal",
+            isRegex: false,
+            enabled: true,
+            description: "test",
+          },
+        ],
+        app.metadataCache,
+        app.vault,
+      );
+
+      expect(result).not.toBeNull();
+      expect(result!.allowed).toBe(false);
+    });
+
+    it("handles three-tag compound rule", () => {
+      const app = new App();
+      app.metadataCache._getFileCache = new CachedMetadata();
+      app.metadataCache._getFileCache.tags = [
+        { tag: "#draft" },
+        { tag: "#internal" },
+        { tag: "#sensitive" },
+      ];
+
+      const result = checkTagFilter(
+        "some/file.md",
+        [
+          {
+            id: "r1",
+            mode: "deny",
+            pattern: "#draft+#internal+#sensitive",
+            isRegex: false,
+            enabled: true,
+            description: "test",
+          },
+        ],
+        app.metadataCache,
+        app.vault,
+      );
+
+      expect(result).not.toBeNull();
+      expect(result!.allowed).toBe(false);
+    });
   });
 });

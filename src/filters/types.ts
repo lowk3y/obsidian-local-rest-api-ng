@@ -17,6 +17,8 @@ export interface FilterRule {
   description: string;
   /** If set, rule only applies to these HTTP methods. Empty/undefined = all methods */
   methods?: HttpMethod[];
+  /** Regex flags extracted from pattern suffix (e.g., "i" from ~pattern/i) */
+  regexFlags?: string;
 }
 
 /** Result of evaluating a file against the filter engine */

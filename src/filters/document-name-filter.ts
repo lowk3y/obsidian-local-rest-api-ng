@@ -24,7 +24,7 @@ export function checkDocumentNameFilter(
 
     if (rule.isRegex) {
       try {
-        matched = new RegExp(rule.pattern).test(basename);
+        matched = new RegExp(rule.pattern, rule.regexFlags).test(basename);
       } catch {
         continue;
       }

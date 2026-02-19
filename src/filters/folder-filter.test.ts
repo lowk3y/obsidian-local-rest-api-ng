@@ -120,6 +120,47 @@ describe("checkFolderFilter", () => {
     });
   });
 
+  describe("regex with /i flag (case-insensitive)", () => {
+    const rules = [
+      makeRule({ pattern: "^private/", isRegex: true, mode: "deny", regexFlags: "i" }),
+    ];
+
+    it("matches case-insensitively with /i flag", () => {
+      const result = checkFolderFilter("Private/secret.md", rules);
+      expect(result).not.toBeNull();
+      expect(result!.allowed).toBe(false);
+    });
+
+    it("matches lowercase with /i flag", () => {
+      const result = checkFolderFilter("private/secret.md", rules);
+      expect(result).not.toBeNull();
+      expect(result!.allowed).toBe(false);
+    });
+
+    it("matches uppercase with /i flag", () => {
+      const result = checkFolderFilter("PRIVATE/secret.md", rules);
+      expect(result).not.toBeNull();
+      expect(result!.allowed).toBe(false);
+    });
+  });
+
+  describe("regex without /i flag stays case-sensitive", () => {
+    const rules = [
+      makeRule({ pattern: "^private/", isRegex: true, mode: "deny" }),
+    ];
+
+    it("matches exact case", () => {
+      const result = checkFolderFilter("private/secret.md", rules);
+      expect(result).not.toBeNull();
+      expect(result!.allowed).toBe(false);
+    });
+
+    it("does not match different case without /i", () => {
+      const result = checkFolderFilter("Private/secret.md", rules);
+      expect(result).toBeNull();
+    });
+  });
+
   describe("dot files", () => {
     const rules = [makeRule({ pattern: "**", mode: "allow" })];
 

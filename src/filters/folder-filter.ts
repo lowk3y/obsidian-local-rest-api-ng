@@ -23,7 +23,7 @@ export function checkFolderFilter(
 
     if (rule.isRegex) {
       try {
-        matched = new RegExp(rule.pattern).test(filePath);
+        matched = new RegExp(rule.pattern, rule.regexFlags).test(filePath);
       } catch {
         continue;
       }

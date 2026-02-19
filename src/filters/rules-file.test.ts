@@ -127,6 +127,33 @@ describe("parseRulesFile", () => {
       const { grouped } = parseRulesFile("allow folder PAI/**");
       expect(grouped.folder[0].isRegex).toBe(false);
     });
+
+    it("extracts /i flag from regex pattern", () => {
+      const { grouped } = parseRulesFile("deny keyword ~password/i");
+      expect(grouped.keyword).toHaveLength(1);
+      expect(grouped.keyword[0].isRegex).toBe(true);
+      expect(grouped.keyword[0].pattern).toBe("password");
+      expect(grouped.keyword[0].regexFlags).toBe("i");
+    });
+
+    it("extracts /gi flags from regex pattern", () => {
+      const { grouped } = parseRulesFile("deny keyword ~password/gi");
+      expect(grouped.keyword[0].regexFlags).toBe("gi");
+      expect(grouped.keyword[0].pattern).toBe("password");
+    });
+
+    it("does not extract flags from non-regex patterns", () => {
+      const { grouped } = parseRulesFile("deny keyword password/i");
+      expect(grouped.keyword[0].isRegex).toBe(false);
+      expect(grouped.keyword[0].pattern).toBe("password/i");
+      expect(grouped.keyword[0].regexFlags).toBeUndefined();
+    });
+
+    it("regex without flags has undefined regexFlags", () => {
+      const { grouped } = parseRulesFile("deny keyword ~password");
+      expect(grouped.keyword[0].isRegex).toBe(true);
+      expect(grouped.keyword[0].regexFlags).toBeUndefined();
+    });
   });
 
   describe("HTTP methods", () => {
@@ -171,6 +198,50 @@ describe("parseRulesFile", () => {
       expect(entries).toHaveLength(2);
       expect(entries[0].lineNumber).toBe(2);
       expect(entries[1].lineNumber).toBe(4);
+    });
+  });
+
+  describe("quoted patterns (spaces in names)", () => {
+    it("parses a quoted folder pattern with spaces", () => {
+      const { grouped } = parseRulesFile('allow folder "00 Workpad/**"');
+      expect(grouped.folder).toHaveLength(1);
+      expect(grouped.folder[0].mode).toBe("allow");
+      expect(grouped.folder[0].pattern).toBe("00 Workpad/**");
+      expect(grouped.folder[0].isRegex).toBe(false);
+    });
+
+    it("parses a quoted pattern with methods", () => {
+      const { grouped } = parseRulesFile(
+        'allow folder "My Documents/**" GET,POST',
+      );
+      expect(grouped.folder).toHaveLength(1);
+      expect(grouped.folder[0].pattern).toBe("My Documents/**");
+      expect(grouped.folder[0].methods).toEqual(["GET", "POST"]);
+    });
+
+    it("parses a disabled quoted pattern", () => {
+      const { entries, grouped } = parseRulesFile(
+        '#!disabled deny folder "00 Workpad/**"',
+      );
+      expect(entries).toHaveLength(1);
+      expect(entries[0].rule.enabled).toBe(false);
+      expect(entries[0].rule.pattern).toBe("00 Workpad/**");
+      expect(grouped.folder).toHaveLength(0);
+    });
+
+    it("rejects unterminated quoted pattern", () => {
+      const spy = jest.spyOn(console, "warn").mockImplementation();
+      const { grouped } = parseRulesFile('allow folder "00 Workpad/**');
+      expect(grouped.folder).toHaveLength(0);
+      spy.mockRestore();
+    });
+
+    it("handles quoted pattern with multiple spaces", () => {
+      const { grouped } = parseRulesFile(
+        'deny folder "My Long Folder Name/**"',
+      );
+      expect(grouped.folder).toHaveLength(1);
+      expect(grouped.folder[0].pattern).toBe("My Long Folder Name/**");
     });
   });
 
@@ -237,6 +308,67 @@ describe("serializeRule", () => {
     expect(serializeRule("folder", rule)).toBe(
       "allow  folder  ~^(PAI|Projects)/",
     );
+  });
+
+  it("serializes regex pattern with /i flag", () => {
+    const rule: FilterRule = {
+      id: "r1",
+      mode: "deny",
+      pattern: "password",
+      isRegex: true,
+      enabled: true,
+      description: "",
+      regexFlags: "i",
+    };
+    expect(serializeRule("keyword", rule)).toBe("deny  keyword  ~password/i");
+  });
+
+  it("roundtrips a regex /i pattern through serialize/parse", () => {
+    const rule: FilterRule = {
+      id: "r1",
+      mode: "deny",
+      pattern: "password",
+      isRegex: true,
+      enabled: true,
+      description: "",
+      regexFlags: "i",
+    };
+    const serialized = serializeRule("keyword", rule);
+    const { grouped } = parseRulesFile(serialized);
+    expect(grouped.keyword).toHaveLength(1);
+    expect(grouped.keyword[0].pattern).toBe("password");
+    expect(grouped.keyword[0].regexFlags).toBe("i");
+    expect(grouped.keyword[0].isRegex).toBe(true);
+  });
+
+  it("quotes patterns containing spaces", () => {
+    const rule: FilterRule = {
+      id: "r1",
+      mode: "allow",
+      pattern: "00 Workpad/**",
+      isRegex: false,
+      enabled: true,
+      description: "",
+    };
+    expect(serializeRule("folder", rule)).toBe(
+      'allow  folder  "00 Workpad/**"',
+    );
+  });
+
+  it("roundtrips a space-containing pattern through serialize/parse", () => {
+    const rule: FilterRule = {
+      id: "r1",
+      mode: "allow",
+      pattern: "00 Workpad/**",
+      isRegex: false,
+      enabled: true,
+      description: "",
+    };
+    const serialized = serializeRule("folder", rule);
+    const { grouped } = parseRulesFile(serialized);
+    expect(grouped.folder).toHaveLength(1);
+    expect(grouped.folder[0].pattern).toBe("00 Workpad/**");
+    expect(grouped.folder[0].mode).toBe("allow");
   });
 
   it("serializes methods", () => {
